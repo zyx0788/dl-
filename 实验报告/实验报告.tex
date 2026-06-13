@@ -382,25 +382,25 @@
 	\subsection{Transformer 模型模拟交易表现}
 	\begin{figure}[H]
 		\centering
-		\includegraphics[width=0.8\textwidth]{result1.jpg}
+		\includegraphics[width=0.5\textwidth]{result1.jpg}
 		\caption{Transformer 模拟交易收益走势}
 		\label{fig:sim}
 	\end{figure}
 	
 	\subsection{LSTM 模型模拟交易表现}
-	实际上我并不会每天买卖5只股票，而是根据模型预测得分动态调整持仓数量。首先是我不能每天九点起床，可能10点以后才开始交易。如果发现模型给我推荐的股票开盘后暴涨，我肯定不会买（毕竟我的模型预测和开盘 价最高价高度相关），卖出是也同理。所以实际上我每天可能只买卖两三只，不过这都是模型给我推荐的，完全在他的预测之内。
+	由于我们组有两个模型，且LSTM模型第一天就赔了两三万而Transformer模型第一天赚钱了，所以我们决定采用Transformer模型，而LSTM模型在比赛交易期间则没有投入很多精力。
 	
-	当然最重要的是，我们组有两个模型，因为我的第一天就赔了两三万而另一个模型第一天赚钱了，所以我们决定采用另一个模型，我对比赛有没有那么重视（做不到九点起床）
-	
-	不过还是要展示一下结果。
+	不过仍将最终结果展示如下：
 	
 	
 	\begin{figure}[H]
 		\centering
-		\includegraphics[width=0.8\textwidth]{result2.jpg}
+		\includegraphics[width=0.5\textwidth]{result2.jpg}
 		\caption{LSTM 模拟交易累计收益走势}
 		\label{fig:sim_lstm}
 	\end{figure}
+	
+	另外由于调仓记录的截图数量过多，因而专门将其置入“调仓记录”文件夹中而没有插入在报告中。
 	
 	\subsection{经验与反思}
 	从两个模型的模拟交易中我们总结了以下几点：
