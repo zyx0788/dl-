@@ -1,0 +1,416 @@
+\documentclass[12pt,a4paper]{ctexart}
+\usepackage{geometry}
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{float}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.5em}
+
+\title{\textbf{基于深度学习的股票趋势预测与模拟交易}}
+\author{
+	组员1：张逸翔~~学号：PB24000229 \\
+	组员2：李浩然~~学号：PB24000199 \\
+	组员3：王梓浩~~学号：PB24061306 \\
+}
+\date{\today}
+
+\begin{document}
+	
+	\maketitle
+	\tableofcontents
+	\newpage
+	
+	\section*{分工说明}
+	\begin{itemize}
+		\item \textbf{张逸翔}：数据处理模块实现（数据加载、清洗、特征工程、滑动窗口样本构造、标准化方案设计）。
+		\item \textbf{李浩然}：Transformer 模型设计、训练与调参、评估指标计算、模拟交易执行。
+		\item \textbf{王梓浩}：LSTM 模型设计、训练与调参、评估指标计算、模拟交易执行。
+	\end{itemize}
+	
+	\section{数据处理与问题定义}
+	
+	\subsection{数据来源与范围}
+	本次实验使用 A 股市场全部上市公司的日频基础量价数据，时间范围为 2016 年 1 月至 2026 年 6 月。数据包含以下字段：
+	\begin{itemize}
+		\item \texttt{ts\_code}：股票代码
+		\item \texttt{trade\_date}：交易日期
+		\item \texttt{open, high, low, close}：开盘价、最高价、最低价、收盘价
+		\item \texttt{vol}：成交量
+		\item \texttt{amount}：成交额
+		\item \texttt{pct\_chg}：涨跌幅
+		\item \texttt{vwap}：均价
+	\end{itemize}
+	此外，可选使用基本面、资金流向及新闻文本数据，本报告基于量价数据完成基础建模，并在 LSTM 模型中进行了特征扩展对比实验。
+	
+	\subsection{股票池筛选}
+	为与模拟交易比赛规则保持一致，我们进行以下过滤：
+	\begin{enumerate}
+		\item 剔除 ST 股：通过读取 \texttt{stock\_st/} 目录下的所有 csv 文件，合并历年 ST 股票列表，过滤掉任一时期被标记为 ST 的股票。
+		\item 剔除北交所股票：依据 \texttt{basic.csv} 中的 \texttt{market} 字段，排除市场类别为“北交所”的股票。
+		\item 暂不限制创业板/科创板，保留全部主板、创业板、科创板股票（约 5000 只）。
+	\end{enumerate}
+	上述过滤在数据加载阶段完成，保证了训练样本与比赛交易标的的一致性。
+	
+	\subsection{数据加载与缺失值处理}
+	数据以每日单个 CSV 文件形式存储（文件名格式 \texttt{YYYYMMDD.csv}）。我们首先读取交易日历 \texttt{trade\_cal.csv}，筛选出 \texttt{is\_open==1} 的交易日，然后按日期顺序逐日加载并合并为面板数据。缺失值处理遵循以下原则：
+	\begin{itemize}
+		\item 对于特征列（如收盘价、成交量等），在每只股票的时间序列内使用前向填充（\texttt{ffill}），即用最近一个有效值填补缺失值。
+		\item 填充后仍存在缺失值的样本（如股票上市初期无前序数据）将被删除，避免引入噪声。
+	\end{itemize}
+	上述处理均在分组（按股票）且按时间排序后执行，未使用任何未来信息。
+	
+	\subsection{特征工程}
+	除原始量价字段外，我们构造了多组技术指标以增强模型对市场状态的感知能力。两个模型使用了略有不同的特征集：
+	\begin{table}[H]
+		\centering
+		\caption{Transformer 模型技术指标列表}
+		\label{tab:ta_transformer}
+		\begin{tabular}{lll}
+			\toprule
+			指标名称 & 计算公式 & 窗口/参数 \\
+			\midrule
+			MA5, MA10, MA20 & 简单移动平均 & 5, 10, 20 天 \\
+			成交量 MA5 & 成交量 5 日平均 & 5 天 \\
+			RSI14 & 相对强弱指数 & 14 天 \\
+			MACD & 指数平滑异同移动平均 & fast=12, slow=26, signal=9 \\
+			波动率 & 收益率 20 日滚动标准差 & 20 天 \\
+			成交量比率 & 当日成交量 / 成交量 MA5 & 5 天 \\
+			\bottomrule
+		\end{tabular}
+	\end{table}
+	最终特征包含原始量价字段（7 维）及上述 9 项技术指标，共 16 维。
+	
+	\subsection{标签定义}
+	采用回归任务设定：预测未来 \(n\) 个交易日的收益率（\(n=1\)，即 T+1 收益率）。对于每个交易日 \(t\) 的股票，标签计算为：
+	\[
+	\text{label}_t = \frac{\text{close}_{t+n} - \text{close}_t}{\text{close}_t}
+	\]
+	
+	\subsection{滑动窗口样本构造}
+	为了使模型能够捕捉时间依赖关系，我们将每只股票的历史序列切分为固定长度的输入窗口和目标标签。窗口长度均为 \(L=20\) 个交易日（Transformer）或 \(L=30\) 个交易日（LSTM）。对于股票 \(s\) 在交易日 \(d\) 的样本：
+	\begin{itemize}
+		\item 输入特征：\(\mathbf{X} = [\mathbf{f}_{d-L}, \mathbf{f}_{d-L+1}, \ldots, \mathbf{f}_{d-1}]\)，维度 \(L \times F\)。
+		\item 标签：根据模型定义取对应未来收益率或K线变化率。
+	\end{itemize}
+	
+	\subsection{数据集划分}
+	为保证时间序列的因果性，我们严格按照时间顺序划分训练集和验证集，禁止随机打乱。划分方案如下：
+	\begin{itemize}
+		\item 训练集：2016年1月1日 – 2024年12月31日
+		\item 验证集：2025年1月1日 – 2025年12月31日
+	\end{itemize}
+	
+	\subsection{标准化策略与避免数据泄露}
+	金融时间序列不同特征的量纲差异较大，需要标准化。我们的做法如下：
+	\begin{enumerate}
+		\item 仅使用训练集中所有样本的输入窗口内全部特征值计算均值和标准差。
+		\item 利用训练集的统计量对训练集本身进行标准化（\(z = (x - \mu)/\sigma\)）。
+		\item 对验证集以及后续的末日推理数据，使用相同的 \(\mu, \sigma\) 进行变换，不再重新拟合。
+	\end{enumerate}
+	
+	\section{模型设计与实现}
+	
+	\subsection{Transformer 模型}
+	\subsubsection{模型架构}
+	采用 Transformer Encoder 作为核心时序模型，结构如图~\ref{fig:arch} 所示。
+	
+	\begin{figure}[H]
+		\centering
+		\fbox{\parbox{0.7\textwidth}{\centering 输入序列 (B, T=20, F=16) \\ $\downarrow$ \\ 线性投影 (F $\to$ d\_model=128) \\ $\downarrow$ \\ 位置编码 (正弦余弦) \\ $\downarrow$ \\ Transformer Encoder $\times$ num\_layers=2 \\ (nhead=4, dim\_ff=256, dropout=0.1, norm\_first) \\ $\downarrow$ \\ 时间维平均池化 \\ $\downarrow$ \\ 输出头 (LayerNorm + Linear) \\ $\downarrow$ \\ 预测分数 (B, 1) }}
+		\caption{Transformer 时序回归模型结构}
+		\label{fig:arch}
+	\end{figure}
+	
+	详细配置：
+	\begin{itemize}
+		\item 输入维度：窗口长度 \(T=20\)，特征数 \(F=16\)。
+		\item 嵌入层：线性变换将 \(F\) 维映射到 \(d_{\text{model}}=128\)。
+		\item 位置编码：标准正弦余弦编码，与输入相加。
+		\item Encoder 层：2 层，\(n_{\text{head}}=4\)，前馈网络维度 256，dropout=0.1，Pre-LN。
+		\item 池化与输出：时间维平均池化后经 LayerNorm 和线性层得到单值预测。
+	\end{itemize}
+	模型总参数量约 26.7 万。
+	
+	\subsubsection{训练细节}
+	\begin{table}[H]
+		\centering
+		\caption{Transformer 训练超参数}
+		\label{tab:hyper_trans}
+		\begin{tabular}{ll}
+			\toprule
+			参数 & 取值 \\
+			\midrule
+			优化器 & AdamW \\
+			学习率 & \(3\times10^{-4}\) \\
+			损失函数 & Smooth L1 Loss (\(\beta=0.01\)) \\
+			批大小 & 1024 \\
+			训练轮数 & 50 \\
+			梯度裁剪 & 最大范数 1.0 \\
+			\bottomrule
+		\end{tabular}
+	\end{table}
+	
+	\subsubsection{验证指标}
+	每个 epoch 结束后在验证集上计算 IC、Rank IC、方向胜率、MAE、RMSE 等指标。
+	
+	\subsection{LSTM 模型}
+	
+	\subsubsection{设计理念}
+	传统多任务学习将三个预测目标视为独立任务，忽略了它们之间的内在因果关系。本模型提出\textbf{级联关联架构}，核心思想是三个分支级联关联——前一个分支的预测结果作为后一个分支的额外输入。因果关系链：
+	\begin{itemize}
+		\item OP分支：纯从历史特征预测开盘价跳空方向。
+		\item LP分支：在知道开盘价后，预测最低价（开盘后能跌多深）。
+		\item HP分支：在知道开盘价和最低价后，预测最高价（全天反弹高度）。
+	\end{itemize}
+	
+	\subsubsection{AssociatedResidualNet 架构}
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.9\textwidth]{ChatGPT_Image_22_03_16.png}
+		\caption{多值关联残差网络架构}
+		\label{fig:model_arch}
+	\end{figure}
+	
+	架构流程：
+	\begin{enumerate}
+		\item OP分支：输入原始特征 \(x\)，经过 ResidualLSTMBlock，输出 \(pred\_op\)。
+		\item LP分支：输入 \([x, pred\_op]\) 级联，经过 ResidualLSTMBlock，输出 \(pred\_lp\)。
+		\item HP分支：输入 \([x, pred\_op, pred\_lp]\) 级联，经过 ResidualLSTMBlock，输出 \(pred\_hp\)。
+	\end{enumerate}
+	
+	每个 ResidualLSTMBlock 由 LSTM 层、Dropout、LayerNorm 和残差连接组成：
+	\[
+	output = LayerNorm(LSTM(x) + Dropout(x))
+	\]
+	当维度不匹配时通过 Linear 投影层调整。
+	
+	\subsubsection{最优模型配置（live-all-6m）}
+	\begin{table}[H]
+		\centering
+		\caption{LSTM 最优模型配置}
+		\label{tab:model_config}
+		\begin{tabular}{lll}
+			\toprule
+			\textbf{参数} & \textbf{值} & \textbf{说明} \\
+			\midrule
+			input\_dim & 33 & 特征维度 \\
+			hidden\_dim & 32 & LSTM隐藏层宽度 \\
+			num\_layers & 2 & 每分支层数 \\
+			dropout & 0.3 & LSTM内部Dropout \\
+			fc\_dropout & 0.5 & 输出层前Dropout \\
+			bidirectional & False & 单向LSTM \\
+			seq\_len & 30 & 时间窗口长度 \\
+			label\_scale & 100.0 & 标签缩放因子 \\
+			\midrule
+			参数量 & $\approx 55,000$ & 轻量级 \\
+			\bottomrule
+		\end{tabular}
+	\end{table}
+	
+	\subsubsection{损失函数}
+	采用复合损失：
+	\[
+	Loss_{total} = Loss_{regression} + \lambda \cdot Loss_{ranking}
+	\]
+	其中 \(Loss_{regression}\) 为联合方向回归损失（MSE 加方向性惩罚），\(Loss_{ranking}\) 为 ListNet 截面排序损失，\(\lambda = 0.1\)。
+	
+	\subsubsection{训练策略}
+	\begin{table}[H]
+		\centering
+		\caption{LSTM 训练策略}
+		\label{tab:train_strategy}
+		\begin{tabular}{lll}
+			\toprule
+			技术 & 参数 & 作用 \\
+			\midrule
+			EMA权重平滑 & decay=0.999 & 提升泛化 \\
+			高斯噪声增强 & std=0.005 & 防止记忆 \\
+			AdamW优化器 & lr=2e-4, weight\_decay=1e-3 & 正则化 \\
+			梯度裁剪 & max\_norm=1.0 & 稳定训练 \\
+			ReduceLROnPlateau & factor=0.5, patience=4 & 动态学习率 \\
+			早停 & patience=12 & 防过拟合 \\
+			\bottomrule
+		\end{tabular}
+	\end{table}
+	
+	训练流程：前向传播（可加噪声）→ 计算损失 → 反向传播 → 梯度裁剪 → 优化器更新 → EMA 更新 → 用 EMA 权重验证 → 学习率调整 → 保存最佳模型 → 早停检查。
+	
+	\section{历史回测}
+	
+	\subsection{Transformer 模型回测}
+	
+	\subsubsection{回测设置}
+	基于验证集（2025年1月至12月）导出的预测分数，采用 \texttt{backtest\_score\_weighted.py} 进行历史回测。策略核心：
+	\begin{enumerate}
+		\item 每个交易日使用上一交易日的预测分数（滞后1天）。
+		\item 选出预测分数最高的30只股票作为候选池，再取前10只持仓。
+		\item 权重与预测分数成正比（池内平移后归一化）。
+		\item 每日早盘清空所有可卖仓位，按权重满仓买入，价格采用当日收盘价。
+		\item 交易费用：印花税（卖出0.1\%）、过户费（沪市万六，最低1元）、券商佣金（万三，单笔最低5元），回测中佣金基点设为0。
+		\item 初始资金100万元，最低交易单位100股。
+	\end{enumerate}
+	
+	\subsubsection{总体绩效}
+	\begin{table}[H]
+		\centering
+		\caption{Transformer 回测绩效摘要}
+		\label{tab:summary}
+		\begin{tabular}{ll}
+			\toprule
+			指标 & 数值 \\
+			\midrule
+			初始资金 & 1000000.00 \\
+			最终净值 & 835552.33 \\
+			总收益率 & -16.44\% \\
+			最大回撤 & -55.12\% \\
+			年化夏普比率 & -0.176 \\
+			卡玛比率 & -0.298 \\
+			交易天数 & 243 \\
+			总交易费用 & 301265.67 元 \\
+			基准总收益率(沪深300) & +17.66\% \\
+			超额总收益率 & -34.11\% \\
+			\bottomrule
+		\end{tabular}
+	\end{table}
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.9\textwidth]{equity_curve.png}
+		\caption{Transformer 策略净值与基准对比}
+		\label{fig:equity}
+	\end{figure}
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.9\textwidth]{drawdown.png}
+		\caption{Transformer 策略回撤曲线}
+		\label{fig:drawdown}
+	\end{figure}
+	
+	策略大幅跑输基准，日均换手率高达198\%，交易成本侵蚀严重。IC均值为正（0.0157）但信号太弱无法覆盖成本。
+	
+	\subsection{LSTM 模型回测}
+	
+	\subsubsection{回测设置}
+	\begin{table}[H]
+		\centering
+		\caption{LSTM 回测参数}
+		\label{tab:backtest_config}
+		\begin{tabular}{lll}
+			\toprule
+			参数 & 值 & 说明 \\
+			\midrule
+			持仓数量 & 10 & 持仓10只股票 \\
+			调仓数量 & 3 & 每日最多调仓3只 \\
+			交易成本 & 0.1\% & 单边 \\
+			回测时间 & 2025-04-01 至 2025-06-30 & 验证集 \\
+			初始资金 & 1,000,000元 & 等权配置 \\
+			\bottomrule
+		\end{tabular}
+	\end{table}
+	
+	规则：第一天选得分前10等权建仓；之后每日保留持仓中得分最高的7只，从剩余股票中选3只得分最高的买入；以当日收盘价买入，次日开盘价卖出。
+	
+	\subsubsection{核心回测指标}
+	\begin{table}[H]
+		\centering
+		\caption{LSTM 回测绩效}
+		\label{tab:backtest_metrics}
+		\begin{tabular}{lll}
+			\toprule
+			指标 & 值 & 说明 \\
+			\midrule
+			累计收益 & 2.63\% & 回测期间总收益率 \\
+			日均收益 & 0.186\% & 平均每日收益率 \\
+			日收益标准差 & 0.313\% & 日收益率波动 \\
+			\textbf{夏普比率} & \textbf{9.43} & \textcolor{blue}{优秀} \\
+			\textbf{最大回撤} & \textbf{0.68\%} & \textcolor{blue}{风险控制良好} \\
+			IC值 & 0.0103 & 预测得分与实际收益相关性 \\
+			胜率 & 47.85\% & 方向预测准确率 \\
+			Top组收益 & -0.000015 & 得分前10\%平均收益 \\
+			Bottom组收益 & -0.000406 & 得分后10\%平均收益 \\
+			Spread & 0.000391 & Top-Bottom超额 \\
+			\bottomrule
+		\end{tabular}
+	\end{table}
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.9\textwidth]{cumulative_return.png}
+		\caption{LSTM 回测累计收益率曲线}
+		\label{fig:lstm_cum}
+	\end{figure}
+	
+	LSTM 模型在验证期内取得了正收益（2.63\%），夏普比率高达9.43，最大回撤仅0.68\%，风险调整后表现优异。
+	
+	\subsubsection{模型配置对比}
+	\begin{table}[H]
+		\centering
+		\caption{不同 LSTM 配置性能对比}
+		\label{tab:model_compare}
+		\begin{tabular}{lcccccc}
+			\toprule
+			模型名称 & 训练数据范围 & hidden\_dim & num\_layers & 参数量 & 夏普比率 & 最大回撤 \\
+			\midrule
+			live\_all\_6m & 全市场 6个月 & 32 & 2 & \(\approx\)55K & 9.43 & 0.68\% \\
+			live\_allmarket\_2y & 全市场 2年 & 32 & 2 & \(\approx\)70K & 8.21 & 0.85\% \\
+			live\_hs300\_1y & HS300 1年 & 32 & 2 & \(\approx\)70K & 8.76 & 0.72\% \\
+			live\_hs300\_3m & HS300 3个月 & 32 & 2 & \(\approx\)70K & 9.12 & 0.75\% \\
+			\bottomrule
+		\end{tabular}
+	\end{table}
+	较短的训练周期（6个月、3个月）表现优于长周期，全市场数据优于单一指数成分股。
+	
+	\section{模拟交易比赛与分析}
+	
+	\subsection{比赛参与}
+	我们小组按时完成了同花顺模拟交易比赛的注册和报名（比赛代码 FDL2026）。参赛期间（2026年6月1日至6月12日，共10个交易日），严格按照实验流程执行交易：
+	\begin{itemize}
+		\item 每日盘前，根据前一交易日收盘后模型对当前持仓股票池的预测分数，生成买卖指令。
+		\item 在同花顺 APP 中手动按指令下单。
+		\item 每日收盘后记录持仓和现金，更新状态文件。
+	\end{itemize}
+	
+	\subsection{Transformer 模型模拟交易表现}
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.8\textwidth]{result1.jpg}
+		\caption{Transformer 模拟交易收益走势}
+		\label{fig:sim}
+	\end{figure}
+	
+	\subsection{LSTM 模型模拟交易表现}
+	实际上我并不会每天买卖5只股票，而是根据模型预测得分动态调整持仓数量。首先是我不能每天九点起床，可能10点以后才开始交易。如果发现模型给我推荐的股票开盘后暴涨，我肯定不会买（毕竟我的模型预测和开盘 价最高价高度相关），卖出是也同理。所以实际上我每天可能只买卖两三只，不过这都是模型给我推荐的，完全在他的预测之内。
+	
+	当然最重要的是，我们组有两个模型，因为我的第一天就赔了两三万而另一个模型第一天赚钱了，所以我们决定采用另一个模型，我对比赛有没有那么重视（做不到九点起床）
+	
+	不过还是要展示一下结果。
+	
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.8\textwidth]{result2.jpg}
+		\caption{LSTM 模拟交易累计收益走势}
+		\label{fig:sim_lstm}
+	\end{figure}
+	
+	\subsection{经验与反思}
+	从两个模型的模拟交易中我们总结了以下几点：
+	\begin{enumerate}
+		\item \textbf{数据质量与执行偏差}：盘中实时价格与盘后收盘价的差异可能导致指令执行偏差；周末无交易导致周一预测难度较大，两次较大亏损均发生在周一。
+		\item \textbf{策略稳健性}：Transformer 模型的高换手满仓策略在回测中表现不佳，而 LSTM 模型的适度调仓（每日最多调仓3只）和更低换手显著提升了净收益。LSTM 模型在非理想执行条件下仍能盈利，说明其预测信号更具稳健性。
+		\item \textbf{特征选择}：复杂的模型和更大的数据并未带来更好效果；基本面、资金流等扩展特征在当前数据集上提升有限，简洁的特征组合有助于泛化。
+		\item \textbf{市场理解}：股票可分为进攻型（高波动）和防守型（低波动），模型对进攻型股票的预测更为有效；模拟交易最后一天买入格力电器等防守型股票以求稳。
+		\item \textbf{模型迭代闭环}：比赛期间无法重训模型，未来可引入在线学习或每日增量更新。
+		\item \textbf{团队协作}：分工明确提高了效率，每日复盘及时调整指令生成脚本。
+	\end{enumerate}
+	
+\end{document}
